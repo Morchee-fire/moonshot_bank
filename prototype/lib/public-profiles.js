@@ -7,6 +7,7 @@
  * Profiles are opt-in — wallets are private by default.
  */
 const historyDb = require("./history-db");
+const { cleanLabel, cleanDisplayName, cleanBio, cleanEmoji } = require("./sanitize");
 const db = historyDb.db;
 
 // ── Schema ──────────────────────────────────────────────────────────────────
@@ -61,6 +62,29 @@ function runMigrations(database = db) {
  * database. Idempotent.
  */
 function runBackfills(database = db) {
+  // Labels stored before write-time filtering existed. Only rows containing a
+  // control character, a bidi override, `<`, `>` or a backtick, or exceeding the
+  // length cap, change — cleanLabel deliberately leaves & ' " alone — so an
+  // ordinary label with an apostrophe is untouched. Every change is logged with
+  // its previous value so a mistake is recoverable from the logs.
+  if (!historyDb._backfillHasRun(database, "profile_wallet_labels_filtered")) {
+    const rows = database.prepare(
+      "SELECT id, label FROM profile_wallets WHERE label IS NOT NULL"
+    ).all();
+    const update = database.prepare("UPDATE profile_wallets SET label = ? WHERE id = ?");
+    let changed = 0;
+    for (const row of rows) {
+      const cleaned = cleanLabel(row.label);
+      if (cleaned !== row.label) {
+        console.log(`[public-profiles] Backfill: profile_wallets.label ${row.id} ${JSON.stringify(row.label)} -> ${JSON.stringify(cleaned)}`);
+        update.run(cleaned, row.id);
+        changed++;
+      }
+    }
+    if (changed) console.log(`[public-profiles] Backfill: filtered ${changed} profile wallet label(s)`);
+    historyDb._markBackfillRun(database, "profile_wallet_labels_filtered");
+  }
+
   // Profiles created before ownership existed have no owner. Adopt the
   // lowest-display_order wallet — the one passed first at creation, which is
   // also the one whose create-profile signature was verified first.
@@ -119,21 +143,26 @@ function createProfile(slug, displayName, options = {}) {
     throw new Error("That URL is already taken — try a different one");
   }
 
+  // Filtered here rather than only in the router, so no future route can write
+  // an unfiltered profile field.
+  const name = cleanDisplayName(displayName);
+  if (!name) throw new Error("displayName is required");
+
   const result = db.prepare(`
     INSERT INTO public_profiles (slug, display_name, owner_address, bio, avatar_emoji, show_balances, show_defi, show_history)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
   `).run(
     cleanSlug,
-    displayName,
+    name,
     options.ownerAddress || null,
-    options.bio || null,
-    options.avatarEmoji || "🚀",
+    cleanBio(options.bio),
+    cleanEmoji(options.avatarEmoji) || "🚀",
     options.showBalances !== false ? 1 : 0,
     options.showDefi !== false ? 1 : 0,
     options.showHistory ? 1 : 0,
   );
 
-  return { id: result.lastInsertRowid, slug: cleanSlug, displayName, ownerAddress: options.ownerAddress || null };
+  return { id: result.lastInsertRowid, slug: cleanSlug, displayName: name, ownerAddress: options.ownerAddress || null };
 }
 
 // Indirection so a test can force the wallet insert to fail and assert the
@@ -201,10 +230,22 @@ function updateProfile(slug, updates) {
     displayName: "display_name", bio: "bio", avatarEmoji: "avatar_emoji",
     showBalances: "show_balances", showDefi: "show_defi", showHistory: "show_history",
   };
+  // Same filters as createProfile. A PATCH must not be a way around them.
+  const filters = {
+    displayName: cleanDisplayName,
+    bio: cleanBio,
+    avatarEmoji: cleanEmoji,
+  };
   for (const [key, col] of Object.entries(fieldMap)) {
     if (updates[key] !== undefined) {
+      const raw = updates[key];
+      const value = typeof raw === "boolean"
+        ? (raw ? 1 : 0)
+        : filters[key] ? filters[key](raw) : raw;
+      // A displayName that filters down to nothing would violate NOT NULL.
+      if (key === "displayName" && !value) continue;
       sets.push(`${col} = ?`);
-      values.push(typeof updates[key] === "boolean" ? (updates[key] ? 1 : 0) : updates[key]);
+      values.push(value);
     }
   }
   if (sets.length === 0) return;
@@ -223,9 +264,12 @@ function deleteProfile(slug) {
 function addWalletToProfile(slug, address, label = null) {
   const profile = db.prepare("SELECT id FROM public_profiles WHERE slug = ?").get(slug);
   if (!profile) throw new Error("Profile not found");
+  if (!/^G[A-Z2-7]{55}$/.test(String(address || ""))) {
+    throw new Error("Invalid Stellar address");
+  }
   const maxOrder = db.prepare("SELECT MAX(display_order) as m FROM profile_wallets WHERE profile_id = ?").get(profile.id);
   db.prepare("INSERT OR IGNORE INTO profile_wallets (profile_id, address, label, display_order) VALUES (?, ?, ?, ?)")
-    .run(profile.id, address, label, (maxOrder?.m || 0) + 1);
+    .run(profile.id, address, cleanLabel(label), (maxOrder?.m || 0) + 1);
 }
 
 function removeWalletFromProfile(slug, address) {

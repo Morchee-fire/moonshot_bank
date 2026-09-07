@@ -128,6 +128,27 @@ function _markBackfillRun(database, key, value = "1") {
  * per database, not on every boot. Idempotent: safe to call repeatedly.
  */
 function runBackfills(database = db) {
+  // Labels stored before write-time filtering existed. See the note in
+  // public-profiles' runBackfills: this only rewrites genuinely unsafe or
+  // over-long values, and logs each change with its previous value.
+  if (!_backfillHasRun(database, "tracked_wallet_labels_filtered")) {
+    const rows = database.prepare(
+      "SELECT address, label FROM tracked_wallets WHERE label IS NOT NULL"
+    ).all();
+    const update = database.prepare("UPDATE tracked_wallets SET label = ? WHERE address = ?");
+    let changed = 0;
+    for (const row of rows) {
+      const cleaned = cleanLabel(row.label);
+      if (cleaned !== row.label) {
+        console.log(`[history-db] Backfill: tracked_wallets.label ${row.address.slice(0, 8)}… ${JSON.stringify(row.label)} -> ${JSON.stringify(cleaned)}`);
+        update.run(cleaned, row.address);
+        changed++;
+      }
+    }
+    if (changed) console.log(`[history-db] Backfill: filtered ${changed} tracked wallet label(s)`);
+    _markBackfillRun(database, "tracked_wallet_labels_filtered");
+  }
+
   // Correction to the hardening review, which said foreign_keys "is never
   // turned on so the FK constraints are decorative": better-sqlite3 enables the
   // pragma by DEFAULT, so they have always been enforced (verified against
@@ -615,6 +636,8 @@ module.exports = {
   DB_PATH,
   runMigrations,
   runBackfills,
+  _backfillHasRun,
+  _markBackfillRun,
   trackWallet,
   untrackWallet,
   setTier,

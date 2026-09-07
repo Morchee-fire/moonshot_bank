@@ -1373,14 +1373,21 @@ app.post("/api/v1/portfolio", sameOriginOnly, async (req, res) => {
 
         grandTotalUSD += walletTotalUSD;
 
-        // Get label from DB
-        const tracked = historyDb.db
-          .prepare("SELECT label FROM tracked_wallets WHERE address = ?")
-          .get(address);
-
+        // NOTE: the label is deliberately NOT read back from tracked_wallets.
+        //
+        // That table is global and was writable by anyone for any address
+        // (PATCH /api/v1/wallets/:address), and this was the ONLY place in the
+        // codebase that read the column back out — so it handed one visitor's
+        // label to every other visitor who happened to query the same address,
+        // and the SPA rendered it raw into innerHTML at six call sites.
+        //
+        // Wallet lists are browser-local (localStorage, WALLETLIST_KEY), and the
+        // SPA already has its own label for every wallet it asked about. It
+        // merges that in by address; the server's copy was redundant as well as
+        // dangerous.
         walletResults.push({
           address,
-          label: tracked?.label || null,
+          label: null,
           totalValueUSD: walletTotalUSD,
           balanceCount: balances.length,
           balances,

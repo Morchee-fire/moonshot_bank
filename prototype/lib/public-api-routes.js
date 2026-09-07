@@ -10,6 +10,7 @@ const path = require("path");
 const profiles = require("./public-profiles");
 const historyDb = require("./history-db");
 const profileAuth = require("./profile-auth");
+const { cleanLabel, cleanDisplayName, cleanBio, cleanEmoji } = require("./sanitize");
 
 // NOTE: this module used to define an htmlEscape() that nothing called. It was
 // left behind when GET /p/:slug stopped rendering HTML server-side and became
@@ -168,7 +169,9 @@ function createRouter(fetchPortfolioFn) {
   router.post("/api/v1/profiles", (req, res) => {
     try {
       const { slug, displayName, bio, avatarEmoji, wallets, showBalances, showDefi, showHistory } = req.body || {};
-      if (!slug || !displayName) return res.status(400).json({ error: "slug and displayName are required" });
+      if (!slug || !cleanDisplayName(displayName)) {
+        return res.status(400).json({ error: "slug and displayName are required" });
+      }
       if (!Array.isArray(wallets) || wallets.length === 0) {
         return res.status(400).json({ error: "At least one signed wallet claim is required to create a profile" });
       }
@@ -188,9 +191,13 @@ function createRouter(fetchPortfolioFn) {
       // membership change requires this wallet's consent.
       const profile = profiles.createProfileWithWallets(
         slug,
-        displayName,
-        { bio, avatarEmoji, showBalances, showDefi, showHistory },
-        wallets
+        cleanDisplayName(displayName),
+        {
+          bio: cleanBio(bio),
+          avatarEmoji: cleanEmoji(avatarEmoji),
+          showBalances, showDefi, showHistory,
+        },
+        wallets.map((w) => ({ address: w.address, label: cleanLabel(w.label) }))
       );
       res.json({ message: "Profile created!", url: `/p/${profile.slug}`, ...profiles.getProfile(profile.slug) });
     } catch (e) { res.status(400).json({ error: e.message }); }
@@ -288,7 +295,7 @@ function createRouter(fetchPortfolioFn) {
         target: address,
       });
 
-      profiles.addWalletToProfile(req.params.slug, address, label);
+      profiles.addWalletToProfile(req.params.slug, address, cleanLabel(label));
       res.json({ message: "Wallet added" });
     } catch (e) { res.status(e.status || 400).json({ error: e.message }); }
   });
