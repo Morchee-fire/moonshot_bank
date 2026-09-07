@@ -30,11 +30,17 @@ const CSP_DIRECTIVES = {
   // exfiltration — all of which the directives below do block.
   //
   // What stands in the way of `script-src 'self'`: four inline <script> blocks
-  // (a nonce solves those) and 78 static on*= attributes, which need converting
-  // to delegated listeners. Every inline handler that was built by string
-  // interpolation is already gone; the remainder are constant strings and so
+  // (a nonce solves those) and 69 static on*= attributes — 67 onclick and 2
+  // onkeydown — which need converting to delegated listeners. Every inline
+  // handler that was built by string interpolation is already gone (9 of them,
+  // taking the total from 78 to 69); the remainder are constant strings and so
   // are not injection vectors, just CSP blockers. That conversion is its own
-  // change — doing 78 of them here would swamp the auth and XSS review.
+  // change — doing 69 of them here would swamp the auth and XSS review.
+  //
+  // Count them with `grep -o 'on[a-z]*="' public/index.html | sort | uniq -c`,
+  // NOT with a plain `grep -c`: that pattern also matches the tail of
+  // `data-action="` and `content="`, which is how the figure 78 was first
+  // mis-stated as the post-change count.
   scriptSrc: ["'self'", "'unsafe-inline'"],
 
   // REQUIRED. index.html carries a large <style> block plus inline style="…"
