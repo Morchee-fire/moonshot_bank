@@ -27,6 +27,7 @@ const createPublicApiRoutes = require("./lib/public-api-routes");
 const { resolveNfts } = require("./lib/nft-resolver");
 const { resolveSorobanCollectibles } = require("./lib/collectibles-resolver");
 const { getTickerPrices } = require("./lib/price-ticker");
+const { cleanLabel } = require("./lib/sanitize");
 
 const app = express();
 // Railway/Cloudflare terminate TLS one hop in front of us. Without this,
@@ -57,24 +58,55 @@ app.use("/api/v1", rateLimitMiddleware);
 // same origin so it works transparently; external scrapers/apps get 403.
 // Not a hard defense — Origin/Referer can be spoofed — but a real speedbump
 // against accidental integration.
-const ALLOWED_ORIGINS = new Set([
+// Overridable so preview deploys work without a code change. Both hostnames
+// below are live and serve this app; note that /api/docs used to advertise
+// moonshotbank-production.up.railway.app, which is a dead Railway app (404
+// "Application not found") — that reference is fixed, not added here.
+const DEFAULT_ALLOWED_ORIGINS = [
   "https://stellarscope.xyz",
   "https://www.stellarscope.xyz",
   "https://stellarscope-production.up.railway.app",
   "http://localhost:4000",
   "http://127.0.0.1:4000",
-]);
+];
+const ALLOWED_ORIGINS = new Set(
+  (process.env.ALLOWED_ORIGINS || "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean)
+    .concat(DEFAULT_ALLOWED_ORIGINS)
+);
+
 function sameOriginOnly(req, res, next) {
   const origin = req.get("Origin");
   const referer = req.get("Referer");
   const refererOrigin = referer ? referer.split("/").slice(0, 3).join("/") : null;
-  const ok = (origin && ALLOWED_ORIGINS.has(origin))
+  // Sec-Fetch-Site is sent by every current browser and cannot be forged by
+  // page JavaScript. It matters because browsers send NO Origin header on
+  // same-origin GETs, so the two gated GET routes below depended entirely on
+  // Referer — which is why users with referrer-stripping extensions got a
+  // permanent 403 on both leaderboards. Additive: Origin/Referer still work,
+  // so browsers too old to send it are unaffected.
+  const fetchSite = req.get("Sec-Fetch-Site");
+  const ok = fetchSite === "same-origin"
+          || (origin && ALLOWED_ORIGINS.has(origin))
           || (refererOrigin && ALLOWED_ORIGINS.has(refererOrigin));
   if (ok) return next();
   return res.status(403).json({
     error: "This endpoint is only reachable from the Stellar Scope UI.",
   });
 }
+
+// One address validator, used by every route that accepts an address. The old
+// `startsWith("G") && length === 56` check let through lowercase letters and the
+// digits 0/1, which are not in the base32 alphabet, and passed them to Horizon.
+const STELLAR_ADDRESS_RE = /^G[A-Z2-7]{55}$/;
+function validAddress(address) {
+  return typeof address === "string" && STELLAR_ADDRESS_RE.test(address);
+}
+// A 50 kB JSON body holds roughly 800 addresses. The UI has no path to more
+// than a handful, and each address costs a Horizon load plus nine adapters.
+const MAX_ADDRESSES_PER_REQUEST = 25;
 
 // ── Test seam ───────────────────────────────────────────────────────────────
 // Route tests must not reach Horizon, CoinGecko or nine DeFi adapters. Every
@@ -369,8 +401,7 @@ app.get("/api/v1/account/:address", async (req, res) => {
     const { address } = req.params;
     const h = getHorizon();
 
-    // Validate Stellar address
-    if (!address.startsWith("G") || address.length !== 56) {
+    if (!validAddress(address)) {
       return res.status(400).json({ error: "Invalid Stellar address" });
     }
 
@@ -895,28 +926,13 @@ app.get("/api/v1/account/:address/snapshot-at", (req, res) => {
 });
 
 // Enable/disable tracking for a wallet
-app.post("/api/v1/account/:address/track", sameOriginOnly, (req, res) => {
-  try {
-    const { address } = req.params;
-    const { label, tier } = req.body || {};
-    historyDb.trackWallet(address, "mainnet", label || null, tier || "free");
-    res.json({ success: true, address, tracked: true, tier: tier || "free" });
-  } catch (e) {
-    console.error("Track wallet error:", e.message);
-    res.status(500).json({ error: "Failed to enable tracking" });
-  }
-});
-
-app.delete("/api/v1/account/:address/track", sameOriginOnly, (req, res) => {
-  try {
-    const { address } = req.params;
-    historyDb.untrackWallet(address);
-    res.json({ success: true, address, tracked: false });
-  } catch (e) {
-    console.error("Untrack wallet error:", e.message);
-    res.status(500).json({ error: "Failed to disable tracking" });
-  }
-});
+// REMOVED: POST and DELETE /api/v1/account/:address/track.
+//
+// Neither had any caller — the SPA uses /api/v1/wallets for both operations
+// (public/index.html). The POST accepted an arbitrary `label` and an
+// unvalidated `tier` for an arbitrary, unvalidated address, so it was a second
+// door to both the stored-XSS label write and the premium-tier bump. The DELETE
+// silently stopped snapshot accumulation for anyone else's wallet.
 
 // History DB stats
 app.get("/api/v1/history/stats", (req, res) => {
@@ -1189,11 +1205,14 @@ app.get("/api/v1/wallets", (req, res) => {
 // tracked wallets to any caller who POSTed).
 app.post("/api/v1/wallets", sameOriginOnly, (req, res) => {
   try {
-    const { address, label, tier } = req.body || {};
-    if (!address || !address.startsWith("G") || address.length !== 56) {
+    // `tier` is deliberately NOT read from the body. No client ever sent one,
+    // and trackWallet did not validate it — so this route was a way to write an
+    // arbitrary tier string, or "premium", onto any address.
+    const { address, label } = req.body || {};
+    if (!validAddress(address)) {
       return res.status(400).json({ error: "Invalid Stellar address" });
     }
-    historyDb.trackWallet(address, "mainnet", label || null, tier || "free");
+    historyDb.trackWallet(address, "mainnet", label ?? null, "free");
     res.json({ success: true, address });
   } catch (e) {
     console.error("Add wallet error:", e.message);
@@ -1206,8 +1225,15 @@ app.patch("/api/v1/wallets/:address", sameOriginOnly, (req, res) => {
   try {
     const { address } = req.params;
     const { label } = req.body || {};
-    historyDb.db.prepare("UPDATE tracked_wallets SET label = ? WHERE address = ?").run(label, address);
-    res.json({ success: true, address, label });
+    // This route wrote any string as the label of any address, with no
+    // validation of either — the stored-XSS write path. Both are checked now,
+    // and the label is filtered before it is stored.
+    if (!validAddress(address)) {
+      return res.status(400).json({ error: "Invalid Stellar address" });
+    }
+    const cleaned = cleanLabel(label);
+    historyDb.db.prepare("UPDATE tracked_wallets SET label = ? WHERE address = ?").run(cleaned, address);
+    res.json({ success: true, address, label: cleaned });
   } catch (e) {
     console.error("Update wallet error:", e.message);
     res.status(500).json({ error: "Failed to update wallet" });
@@ -1219,6 +1245,9 @@ app.patch("/api/v1/wallets/:address", sameOriginOnly, (req, res) => {
 app.delete("/api/v1/wallets/:address", sameOriginOnly, (req, res) => {
   try {
     const { address } = req.params;
+    if (!validAddress(address)) {
+      return res.status(400).json({ error: "Invalid Stellar address" });
+    }
     historyDb.untrackWallet(address);
     res.json({ success: true, address });
   } catch (e) {
@@ -1228,7 +1257,10 @@ app.delete("/api/v1/wallets/:address", sameOriginOnly, (req, res) => {
 });
 
 // Aggregated multi-wallet portfolio
-app.post("/api/v1/portfolio", async (req, res) => {
+// Gated: browsers send an Origin header on every POST, same-origin included,
+// so unlike the Referer-dependent GET routes this does not break for users with
+// referrer-stripping extensions.
+app.post("/api/v1/portfolio", sameOriginOnly, async (req, res) => {
   try {
     const { addresses } = req.body || {};
 
@@ -1236,6 +1268,16 @@ app.post("/api/v1/portfolio", async (req, res) => {
     // tracked_wallets list when addresses were empty — that leaked every
     // tracked wallet's balances to any caller.
     const walletAddresses = Array.isArray(addresses) ? addresses : [];
+
+    const invalid = walletAddresses.filter((a) => !validAddress(a));
+    if (invalid.length > 0) {
+      return res.status(400).json({ error: "Invalid Stellar address in addresses[]" });
+    }
+    if (walletAddresses.length > MAX_ADDRESSES_PER_REQUEST) {
+      return res.status(400).json({
+        error: `Too many addresses — ${MAX_ADDRESSES_PER_REQUEST} maximum per request`,
+      });
+    }
 
     if (walletAddresses.length === 0) {
       return res.json({
@@ -1350,20 +1392,35 @@ app.post("/api/v1/portfolio", async (req, res) => {
           defiDegraded,
         });
 
-        // Auto-snapshot
+        // Auto-snapshot — for wallets that are ALREADY tracked, at most once
+        // every five minutes.
+        //
+        // Two bugs lived here. First, snapshot_at is stored as SQLite
+        // datetime('now') ("2026-09-04 17:30:00") and was string-compared
+        // against an ISO timestamp ("2026-09-04T17:25:00.000Z"); at index 10
+        // ' ' < 'T', so "older than five minutes" was ALWAYS true and every
+        // request wrote a row. Second, recordSnapshot unconditionally called
+        // trackWallet, so an anonymous caller permanently enrolled arbitrary
+        // addresses into the hourly scheduler — and because upsertWallet forced
+        // tracking_enabled = 1, it also resurrected wallets a user had removed.
+        //
+        // This is a read path. It records history for wallets someone has
+        // deliberately added and enrols nothing.
         try {
-          const latest = historyDb.getLatestSnapshot(address, "mainnet");
-          const fiveMinAgo = new Date(Date.now() - 5 * 60 * 1000).toISOString();
-          if (!latest || latest.snapshot_at < fiveMinAgo) {
-            historyDb.recordSnapshot({
-              address,
-              network: "mainnet",
-              totalValueUSD: walletTotalUSD,
-              xlmPrice,
-              balanceCount: balances.length,
-              balances,
-              defiPositions,
-            }, "mainnet");
+          if (historyDb.isTracked(address)) {
+            const latest = historyDb.getLatestSnapshot(address, "mainnet");
+            const lastMs = latest ? Date.parse(latest.snapshot_at.replace(" ", "T") + "Z") : 0;
+            if (!Number.isFinite(lastMs) || lastMs < Date.now() - 5 * 60 * 1000) {
+              historyDb.recordSnapshot({
+                address,
+                network: "mainnet",
+                totalValueUSD: walletTotalUSD,
+                xlmPrice,
+                balanceCount: balances.length,
+                balances,
+                defiPositions,
+              }, "mainnet");
+            }
           }
         } catch (e) {}
       } catch (e) {
@@ -1398,7 +1455,7 @@ app.post("/api/v1/portfolio", async (req, res) => {
 });
 
 // Aggregated portfolio history across all wallets
-app.post("/api/v1/portfolio/history", (req, res) => {
+app.post("/api/v1/portfolio/history", sameOriginOnly, (req, res) => {
   try {
     const { addresses } = req.body || {};
     const range = req.query.range || "30d";
@@ -1406,6 +1463,15 @@ app.post("/api/v1/portfolio/history", (req, res) => {
     // Callers must supply addresses. Previously we defaulted to the global
     // tracked_wallets list when addresses were empty — a privacy leak.
     const walletAddresses = Array.isArray(addresses) ? addresses : [];
+
+    if (walletAddresses.some((a) => !validAddress(a))) {
+      return res.status(400).json({ error: "Invalid Stellar address in addresses[]" });
+    }
+    if (walletAddresses.length > MAX_ADDRESSES_PER_REQUEST) {
+      return res.status(400).json({
+        error: `Too many addresses — ${MAX_ADDRESSES_PER_REQUEST} maximum per request`,
+      });
+    }
 
     // Get history for each wallet and merge by timestamp
     const timeMap = new Map(); // timestamp → { totalValueUSD, perWallet }
@@ -1453,35 +1519,31 @@ app.post("/api/v1/portfolio/history", (req, res) => {
   }
 });
 
-// Set tracking tier (premium feature hook)
-app.post("/api/v1/account/:address/tier", (req, res) => {
-  try {
-    const { address } = req.params;
-    const { tier } = req.body || {};
-    if (!tier) return res.status(400).json({ error: "tier is required (free, basic, pro, premium)" });
-    historyDb.setTier(address, tier);
-    res.json({ success: true, address, tier });
-  } catch (e) {
-    console.error("Set tier error:", e.message);
-    res.status(400).json({ error: e.message });
-  }
-});
+// REMOVED: POST /api/v1/account/:address/tier.
+//
+// It had no authentication of any kind and no same-origin gate, so anyone could
+// move any tracked address to the 5-minute snapshot cadence. It gated a
+// "premium feature" that does not exist — there is no billing, no entitlement
+// and no account system. historyDb.setTier remains exported for whenever one
+// arrives, with a real authorization check in front of it.
 
 // Scheduler stats
 app.get("/api/v1/scheduler/stats", (req, res) => {
   res.json(snapshotScheduler.getStats());
 });
 
-// Manual downsample trigger (admin)
-app.post("/api/v1/history/downsample", (req, res) => {
-  try {
-    const result = historyDb.downsampleAll(req.body || {});
-    res.json({ success: true, ...result });
-  } catch (e) {
-    console.error("Downsample error:", e.message);
-    res.status(500).json({ error: "Failed to downsample" });
-  }
-});
+// REMOVED: POST /api/v1/history/downsample.
+//
+// CRITICAL. The comment called it "(admin)" and that was the entire access
+// control: no auth, not even the same-origin gate. It passed req.body straight
+// into downsampleAll, so {"fullResDays":0,"maxDays":0} deleted every row in
+// portfolio_snapshots for every tracked wallet, plus the orphan sweep over
+// token_snapshots. An unauthenticated request wiped all portfolio history.
+//
+// Nothing is lost by removing it: downsampleAll() already ran at startup, and
+// it now also runs on a 24-hour interval (see startBackgroundWork). Note the
+// review's claim that "the scheduler already downsamples" was not quite right —
+// it was a startup-only call, which is why the interval was added.
 
 // Top XLM whales leaderboard
 const EXCLUDED_WHALES = new Set([
