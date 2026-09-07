@@ -619,6 +619,15 @@ function downsampleAll(options) {
 /**
  * Get DB stats.
  */
+/**
+ * DB stats for /api/health and /api/v1/history/stats.
+ *
+ * dbPath is deliberately NOT included. It used to be, and BOTH of those routes
+ * are unauthenticated, so the container's filesystem layout was public. The
+ * resolved path is logged once at boot instead, where the deploy logs can show
+ * it — which is also where you check that a Railway volume mount actually took
+ * effect.
+ */
 function getStats() {
   const walletCount = db.prepare("SELECT COUNT(*) as c FROM tracked_wallets WHERE tracking_enabled = 1").get().c;
   const snapshotCount = db.prepare("SELECT COUNT(*) as c FROM portfolio_snapshots").get().c;
@@ -628,7 +637,6 @@ function getStats() {
     totalSnapshots: snapshotCount,
     dbSizeBytes: dbSize,
     dbSizeMB: (dbSize / 1024 / 1024).toFixed(2),
-    dbPath: DB_PATH,
   };
 }
 

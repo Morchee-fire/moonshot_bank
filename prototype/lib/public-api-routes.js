@@ -435,12 +435,12 @@ a{color:var(--accent)}
 
 <h2>Example</h2>
 <pre>// Fetch any wallet — no key needed
-fetch("https://moonshotbank-production.up.railway.app/api/v1/public/account/GABC...XYZ")
+fetch("https://stellarscope.xyz/api/v1/public/account/GABC...XYZ")
   .then(r => r.json())
   .then(data => console.log(data.totalValueUSD));</pre>
 
 <pre>// cURL
-curl https://moonshotbank-production.up.railway.app/api/v1/public/account/GABC...XYZ</pre>
+curl https://stellarscope.xyz/api/v1/public/account/GABC...XYZ</pre>
 </div></body></html>`);
   });
 

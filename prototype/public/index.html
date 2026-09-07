@@ -40,28 +40,52 @@
     Freighter, Albedo, LOBSTR, Hana, Rabet directly via named buttons, and
     falls back to its built-in modal for the same set (xBull is currently
     disabled — see the module-level comment for why). The kit is loaded as
-    ESM from esm.sh; the inline page script below stays a classic script and
-    uses window.connectWalletById / window.connectWalletViaModal which this
-    module installs on window.
+    ESM from a self-hosted bundle; the inline page script below stays a classic
+    script and uses window.connectWalletById / window.connectWalletViaModal
+    which this module installs on window.
   -->
   <script type="module">
-    // Freighter + LOBSTR use ?bundle because their underlying npm packages
-    // only expose a default export on esm.sh, while the kit imports named
-    // members from them. Without ?bundle the module fails with a
-    // SyntaxError and every wallet button stops working.
+    // SELF-HOSTED. This used to be six live imports from
+    // https://esm.sh/@creit.tech/stellar-wallets-kit@2.3.0?bundle — the code
+    // that runs fetchAddress() and signMessage(), fetched from a third party on
+    // every page load, with `?bundle` meaning that third party resolved the
+    // transitive dependency graph at request time. The bytes were never pinned,
+    // and a hijacked response could serve a fake wallet modal to every visitor.
+    //
+    // Now built from the version pinned in package.json:
+    //   npm run build:vendor   (see vendor-src/stellar-wallets-kit.entry.js)
+    //
+    // Note on SRI: `integrity` cannot be applied to an ES module specifier, only
+    // to a classic <script src> or a <link>. Merging this module block into the
+    // classic script below to get SRI is NOT an option — this block declares
+    // `const CONNECTED_ADDR_KEY` (see below) which the classic block declares
+    // again, deliberately, because module scope hides the first. Two const
+    // declarations in one scope is a SyntaxError that would abort parsing of the
+    // entire 4000-line page script. Self-hosting is the fix that matters here;
+    // the file is served from our own origin under script-src 'self'.
     //
     // xBull is intentionally not loaded: @creit.tech/xbull-wallet-connect
-    // imports `encodeUTF8` as a named member of tweetnacl-util (which only
-    // ships a default export on esm.sh), and its ?bundle URL returns
-    // HTTP 500 because esbuild can't resolve a tslib helper. Until there's
-    // a workable CDN setup or self-hosted bundle, xBull users can paste
-    // their G-address into the wallet panel manually.
-    import { StellarWalletsKit, Networks } from "https://esm.sh/@creit.tech/stellar-wallets-kit@2.3.0?bundle";
-    import { FreighterModule, FREIGHTER_ID } from "https://esm.sh/@creit.tech/stellar-wallets-kit@2.3.0/modules/freighter?bundle";
-    import { LobstrModule, LOBSTR_ID } from "https://esm.sh/@creit.tech/stellar-wallets-kit@2.3.0/modules/lobstr?bundle";
-    import { AlbedoModule, ALBEDO_ID } from "https://esm.sh/@creit.tech/stellar-wallets-kit@2.3.0/modules/albedo";
-    import { HanaModule, HANA_ID } from "https://esm.sh/@creit.tech/stellar-wallets-kit@2.3.0/modules/hana";
-    import { RabetModule, RABET_ID } from "https://esm.sh/@creit.tech/stellar-wallets-kit@2.3.0/modules/rabet";
+    // imports `encodeUTF8` as a named member of tweetnacl-util, which only
+    // ships a default export, and it could not be bundled cleanly. xBull users
+    // can paste their G-address into the wallet panel manually.
+    //
+    // ROLLBACK: to go back to the CDN, restore these six lines
+    //   import { StellarWalletsKit, Networks } from "https://esm.sh/@creit.tech/stellar-wallets-kit@2.3.0?bundle";
+    //   import { FreighterModule, FREIGHTER_ID } from "https://esm.sh/@creit.tech/stellar-wallets-kit@2.3.0/modules/freighter?bundle";
+    //   import { LobstrModule, LOBSTR_ID } from "https://esm.sh/@creit.tech/stellar-wallets-kit@2.3.0/modules/lobstr?bundle";
+    //   import { AlbedoModule, ALBEDO_ID } from "https://esm.sh/@creit.tech/stellar-wallets-kit@2.3.0/modules/albedo";
+    //   import { HanaModule, HANA_ID } from "https://esm.sh/@creit.tech/stellar-wallets-kit@2.3.0/modules/hana";
+    //   import { RabetModule, RABET_ID } from "https://esm.sh/@creit.tech/stellar-wallets-kit@2.3.0/modules/rabet";
+    // AND add https://esm.sh to script-src in the CSP (lib/security-headers.js),
+    // or the imports are blocked with no visible error.
+    import {
+      StellarWalletsKit, Networks,
+      FreighterModule, FREIGHTER_ID,
+      LobstrModule, LOBSTR_ID,
+      AlbedoModule, ALBEDO_ID,
+      HanaModule, HANA_ID,
+      RabetModule, RABET_ID,
+    } from "/vendor/stellar-wallets-kit-2.3.0.js";
 
     StellarWalletsKit.init({
       network: Networks.PUBLIC,

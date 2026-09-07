@@ -33,7 +33,19 @@ const app = express();
 // Railway/Cloudflare terminate TLS one hop in front of us. Without this,
 // req.ip resolves to the proxy's IP and rate-limiting buckets every user
 // into one shared quota.
-app.set("trust proxy", 1);
+// Railway/Cloudflare terminate TLS in front of us. The hop count is an env var
+// because with Cloudflare ALSO in front of Railway it is two hops, not one — and
+// if it is wrong, req.ip resolves to the proxy's IP and the entire site shares a
+// single 60-requests-per-minute bucket. /api/health echoes the resolved req.ip
+// so this can be measured against the real deployment rather than guessed. The
+// default is unchanged.
+app.set("trust proxy", parseInt(process.env.TRUST_PROXY_HOPS || "1", 10));
+// Express advertises itself by default; there is no reason to name the framework
+// and its version range to every caller.
+app.disable("x-powered-by");
+// Security headers, including the CSP. Installed before anything that can
+// respond, so every route and static file carries them.
+require("./lib/security-headers").installSecurityHeaders(app);
 app.use(cors());
 // Cap request body size so a rogue POST can't exhaust memory.
 app.use(express.json({ limit: "50kb" }));
@@ -1809,6 +1821,10 @@ app.get("/api/health", (req, res) => {
   res.json({
     status: "ok",
     network: "mainnet",
+    // Resolved client IP as the rate limiter sees it. If this is a Cloudflare
+    // edge address rather than a real client, TRUST_PROXY_HOPS is too low and
+    // every visitor is sharing one rate-limit bucket.
+    clientIp: req.ip,
     sorobanRpc: require("./lib/soroban-rpc").SOROBAN_RPC_URL,
     configuredProtocols: PROTOCOL_ADAPTERS.filter((a) => a.isConfigured()).map((a) => a.protocolId),
     registeredSorobanTokens: getRegistry().filter((t) => t.enabled).length,

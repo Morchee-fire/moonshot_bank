@@ -157,9 +157,17 @@ function stop() {
  * Get scheduler stats.
  */
 function getStats() {
+  // lastError used to carry the wallet address it failed on. This is served
+  // unauthenticated from /api/v1/scheduler/stats, so it handed out another
+  // user's tracked address — the same class of cross-user leak the wallet-list
+  // and portfolio routes were already fixed for. Message and timestamp only.
+  const { lastError, ...rest } = _stats;
   return {
     running: !!_interval,
-    ..._stats,
+    ...rest,
+    lastError: lastError
+      ? { message: lastError.message, at: lastError.at }
+      : null,
     tierIntervals: Object.fromEntries(
       Object.entries(TIER_INTERVALS).map(([k, v]) => [k, `${v / 60000} min`])
     ),
