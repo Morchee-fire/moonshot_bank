@@ -1,0 +1,27 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        # The real lockfile lives in prototype/. The repo root has a 143-byte
+        # stub lock for a package with no dependencies.
+        working-directory: prototype
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: prototype/package-lock.json
+      - run: npm ci
+      - run: npm test
+      # Fails the build on a new high-severity advisory. That is the point:
+      # the repo shipped four of them unnoticed.
+      - run: npm audit --audit-level=high

@@ -22,8 +22,14 @@ const db = new Database(DB_PATH);
 db.pragma("journal_mode = WAL");
 
 // ── Schema ────────────────────────────────────────────────────────────────────
+//
+// Exported as plain functions so tests can run them against a scratch database
+// and assert they are idempotent. Re-requiring this module to re-run them is not
+// an option: `require` is cached, and busting the cache opens a second
+// better-sqlite3 connection to the same file while the first is still live.
 
-db.exec(`
+function runMigrations(database = db) {
+  database.exec(`
   CREATE TABLE IF NOT EXISTS tracked_wallets (
     address TEXT PRIMARY KEY,
     network TEXT NOT NULL DEFAULT 'mainnet',
@@ -88,13 +94,63 @@ db.exec(`
     WHERE last_nonzero_at IS NOT NULL;
 `);
 
-// Migration: add tier column if upgrading from an older schema
-try {
-  db.prepare("SELECT tier FROM tracked_wallets LIMIT 1").get();
-} catch (e) {
-  db.exec("ALTER TABLE tracked_wallets ADD COLUMN tier TEXT NOT NULL DEFAULT 'free'");
-  console.log("[history-db] Migrated: added tier column to tracked_wallets");
+  // Migration: add tier column if upgrading from an older schema
+  try {
+    database.prepare("SELECT tier FROM tracked_wallets LIMIT 1").get();
+  } catch (e) {
+    database.exec("ALTER TABLE tracked_wallets ADD COLUMN tier TEXT NOT NULL DEFAULT 'free'");
+    console.log("[history-db] Migrated: added tier column to tracked_wallets");
+  }
+
+  // Bookkeeping for one-shot data migrations — see runBackfills().
+  database.exec(`
+    CREATE TABLE IF NOT EXISTS schema_meta (
+      key TEXT PRIMARY KEY,
+      value TEXT,
+      applied_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+  `);
 }
+
+function _backfillHasRun(database, key) {
+  return !!database.prepare("SELECT 1 FROM schema_meta WHERE key = ?").get(key);
+}
+
+function _markBackfillRun(database, key, value = "1") {
+  database
+    .prepare("INSERT OR REPLACE INTO schema_meta (key, value) VALUES (?, ?)")
+    .run(key, String(value));
+}
+
+/**
+ * One-shot data migrations. Each is gated on a schema_meta row so it runs once
+ * per database, not on every boot. Idempotent: safe to call repeatedly.
+ */
+function runBackfills(database = db) {
+  // Foreign keys were never enforced (the pragma was off), so historical rows
+  // may reference wallets that no longer exist. They have to go before
+  // `foreign_keys = ON` can be turned on, or an ordinary insert starts failing.
+  if (!_backfillHasRun(database, "orphan_snapshots_cleaned")) {
+    const orphanSnapshots = database.prepare(`
+      DELETE FROM portfolio_snapshots
+      WHERE address NOT IN (SELECT address FROM tracked_wallets)
+    `).run();
+    const orphanTokens = database.prepare(`
+      DELETE FROM token_snapshots
+      WHERE snapshot_id NOT IN (SELECT id FROM portfolio_snapshots)
+    `).run();
+    if (orphanSnapshots.changes || orphanTokens.changes) {
+      console.log(
+        `[history-db] Backfill: removed ${orphanSnapshots.changes} orphaned snapshot(s) ` +
+        `and ${orphanTokens.changes} orphaned token row(s) before enabling foreign_keys`
+      );
+    }
+    _markBackfillRun(database, "orphan_snapshots_cleaned");
+  }
+}
+
+runMigrations();
+runBackfills();
 
 // ── Prepared Statements ───────────────────────────────────────────────────────
 
@@ -477,6 +533,9 @@ function getStats() {
 }
 
 module.exports = {
+  DB_PATH,
+  runMigrations,
+  runBackfills,
   trackWallet,
   untrackWallet,
   setTier,

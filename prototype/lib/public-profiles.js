@@ -10,8 +10,13 @@ const historyDb = require("./history-db");
 const db = historyDb.db;
 
 // ── Schema ──────────────────────────────────────────────────────────────────
+//
+// Exported as plain functions for the same reason as history-db's: tests need to
+// run them against a scratch database and assert idempotency without busting
+// require.cache.
 
-db.exec(`
+function runMigrations(database = db) {
+  database.exec(`
   CREATE TABLE IF NOT EXISTS public_profiles (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     slug TEXT UNIQUE NOT NULL,
@@ -39,6 +44,19 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_profiles_slug ON public_profiles(slug);
   CREATE INDEX IF NOT EXISTS idx_profile_wallets_profile ON profile_wallets(profile_id);
 `);
+}
+
+/**
+ * One-shot data migrations for profiles. Gated on schema_meta rows (created by
+ * history-db's runMigrations, which shares this database), so each runs once per
+ * database. Idempotent.
+ */
+function runBackfills(database = db) {
+  // placeholder — populated by later phases
+}
+
+runMigrations();
+runBackfills();
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -169,6 +187,7 @@ function listPublicProfiles(limit = 50) {
 }
 
 module.exports = {
+  runMigrations, runBackfills,
   createProfile, getProfile, updateProfile, deleteProfile,
   addWalletToProfile, removeWalletFromProfile, listPublicProfiles,
   listProfilesByWallet, isSlugAvailable,

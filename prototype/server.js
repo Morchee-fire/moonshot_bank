@@ -76,6 +76,21 @@ function sameOriginOnly(req, res, next) {
   });
 }
 
+// ── Test seam ───────────────────────────────────────────────────────────────
+// Route tests must not reach Horizon, CoinGecko or nine DeFi adapters. Every
+// upstream call in POST /api/v1/portfolio goes through _deps, and
+// __setTestDeps() is the only way to replace them — a no-op unless
+// NODE_ENV === "test", so it cannot be reached in production.
+const _deps = {
+  getHorizon: (...a) => getHorizon(...a),
+  getXLMPrice: (...a) => getXLMPrice(...a),
+  collectDefiPositions: (...a) => collectDefiPositions(...a),
+};
+function __setTestDeps(overrides) {
+  if (process.env.NODE_ENV !== "test") return;
+  Object.assign(_deps, overrides);
+}
+
 // Mainnet only — read-only portfolio tracker
 const HORIZON_URL = "https://horizon.stellar.org";
 
@@ -121,8 +136,13 @@ function withTimeout(promise, ms, label) {
 // multi-second factory enumeration on a user's request. Refresh slightly
 // inside the adapter's 1h cache TTL.
 const { warmSoroswapUniverse } = require("./lib/adapters/lp-discovery");
-warmSoroswapUniverse().catch(() => {});
-setInterval(() => warmSoroswapUniverse().catch(() => {}), 50 * 60_000);
+// Only warm on a real server boot. Requiring this module from a test must not
+// fire network calls, and must not leave a live interval holding the event loop
+// open (node --test would never exit).
+if (require.main === module) {
+  warmSoroswapUniverse().catch(() => {});
+  setInterval(() => warmSoroswapUniverse().catch(() => {}), 50 * 60_000).unref?.();
+}
 
 // Last-known-good adapter results, keyed `${address}:${adapterName}`.
 // When an adapter times out or errors, we serve its recent result instead
@@ -1227,8 +1247,8 @@ app.post("/api/v1/portfolio", async (req, res) => {
       });
     }
 
-    const h = getHorizon();
-    const xlmPrice = await getXLMPrice();
+    const h = _deps.getHorizon();
+    const xlmPrice = await _deps.getXLMPrice();
 
     // Seed XLM SAC price so Blend adapter avoids redundant CoinGecko call
     pricingEngine.seedSorobanPrice("CAS3J7GYLGXMF6TDJBBYYSE3HQ6BBSMLNUQ34T6TZMYMW2EVH34XOWMA", {
@@ -1306,7 +1326,7 @@ app.post("/api/v1/portfolio", async (req, res) => {
 
         // DeFi positions — all protocol adapters in parallel with timeouts
         const { defiPositions, defiByPool, totalUSD: defiTotalUSD, degraded: defiDegraded } =
-          await collectDefiPositions(address, xlmPrice);
+          await _deps.collectDefiPositions(address, xlmPrice);
         walletTotalUSD += defiTotalUSD;
 
         grandTotalUSD += walletTotalUSD;
@@ -1681,9 +1701,13 @@ async function computePortfolioWhales() {
   }
 }
 
-// Kick off on startup, refresh every 30 minutes
-computePortfolioWhales();
-setInterval(computePortfolioWhales, PORTFOLIO_WHALE_TTL);
+// Kick off on startup, refresh every 30 minutes. Gated on a real boot so that
+// requiring this module from a test doesn't launch a multi-minute stellar.expert
+// + Horizon crawl and doesn't hold the event loop open.
+if (require.main === module) {
+  computePortfolioWhales();
+  setInterval(computePortfolioWhales, PORTFOLIO_WHALE_TTL).unref?.();
+}
 
 app.get("/api/v1/portfolio-whales", sameOriginOnly, async (req, res) => {
   if (req.query.refresh === "1" && !portfolioWhaleComputing) {
@@ -1839,10 +1863,20 @@ const PORT = process.env.PORT || 4000;
 // Public API + portfolio profiles
 app.use(createPublicApiRoutes(fetchPortfolioForScheduler));
 
-app.listen(PORT, () => {
-  console.log(`Stellar Moonshot Bank API running on http://localhost:${PORT}`);
-  console.log(`Dashboard: http://localhost:${PORT}`);
+// Every registered adapter must carry a protocolId — /api/health reports them
+// and a missing one shows up as a `null` in the list (BlendAdapter did exactly
+// that in production). Fail loudly at boot rather than serving a null forever.
+function assertAdaptersConfigured(adapters = PROTOCOL_ADAPTERS) {
+  const nameless = adapters.filter((a) => !a || typeof a.protocolId !== "string" || !a.protocolId);
+  if (nameless.length > 0) {
+    throw new Error(
+      `[boot] ${nameless.length} protocol adapter(s) have no protocolId: ` +
+      nameless.map((a) => a?.name || a?.protocolLabel || "<unnamed>").join(", ")
+    );
+  }
+}
 
+function startBackgroundWork() {
   // Start background snapshot scheduler
   snapshotScheduler.start();
 
@@ -1855,8 +1889,12 @@ app.listen(PORT, () => {
   // Start FX efficiency ladder refresh (EURC/CETES/TESOURO depth tables)
   fxEfficiency.start();
 
-  // Run daily downsampling at startup (and it could be scheduled via cron too)
-  setTimeout(() => {
+  // Prune old snapshots at startup and then daily. This used to be startup-only
+  // (with a comment saying it "could be scheduled via cron too"), which meant
+  // pruning only ever happened on deploy — and it was also exposed as an
+  // unauthenticated POST /api/v1/history/downsample that could wipe every
+  // snapshot in the database. The route is gone; this is the only caller.
+  const runDownsample = () => {
     try {
       const result = historyDb.downsampleAll();
       if (result.totalDeletedRows > 0) {
@@ -1865,5 +1903,37 @@ app.listen(PORT, () => {
     } catch (e) {
       console.error("[Cleanup] Downsample error:", e.message);
     }
-  }, 30_000);
-});
+  };
+  setTimeout(runDownsample, 30_000).unref?.();
+  setInterval(runDownsample, 24 * 60 * 60_000).unref?.();
+}
+
+// A stray rejection used to take the whole process down — notably
+// snapshot-scheduler's tick(), whose getTrackedWallets() sits in a
+// try/finally with no catch and whose callers discard the promise. A
+// SQLITE_BUSY there killed the server. Log and keep serving instead.
+function installProcessHandlers() {
+  process.on("unhandledRejection", (reason) => {
+    console.error("[process] Unhandled rejection:", reason instanceof Error ? reason.stack : reason);
+  });
+  process.on("SIGTERM", () => {
+    console.log("[process] SIGTERM — closing database and exiting");
+    try { historyDb.db.close(); } catch (e) { console.error("[process] DB close failed:", e.message); }
+    process.exit(0);
+  });
+}
+
+// Only boot when run directly. `require("./server")` must be side-effect free
+// so tests can mount the app without opening a port or starting timers.
+if (require.main === module) {
+  assertAdaptersConfigured();
+  installProcessHandlers();
+  app.listen(PORT, () => {
+    console.log(`Stellar Moonshot Bank API running on http://localhost:${PORT}`);
+    console.log(`Dashboard: http://localhost:${PORT}`);
+    console.log(`[history-db] Using database at ${historyDb.DB_PATH}`);
+    startBackgroundWork();
+  });
+}
+
+module.exports = { app, __setTestDeps, assertAdaptersConfigured, PROTOCOL_ADAPTERS };
