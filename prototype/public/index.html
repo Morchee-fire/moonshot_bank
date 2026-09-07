@@ -3730,16 +3730,33 @@
         showDefi: !!profile.showDefi,
         showHistory: !!profile.showHistory,
         wallets: profile.wallets || [],
-        signingAddress: cpState.wallet?.address || (profile.wallets?.[0]?.address ?? null),
+        ownerAddress: profile.ownerAddress || null,
+        // The connected wallet, and only the connected wallet, can sign. The
+        // old fallback to profile.wallets[0] produced a challenge bound to an
+        // address the user could not sign for, so every save failed with an
+        // opaque "Challenge does not match address".
+        signingAddress: cpState.wallet?.address || null,
+        isOwner: !!cpState.wallet?.address && cpState.wallet.address === profile.ownerAddress,
+        isMember: (profile.wallets || []).some(w => w.address === cpState.wallet?.address),
         saving: false,
         deleteConfirmText: "",
       };
 
       const walletList = mpState.wallets.map(w => `
         <div class="cp-wallet-pill" style="margin:4px 4px 0 0" title="${escapeHtml(w.address)}">
-          ${w.label ? escapeHtml(w.label) + " · " : ""}${w.address.slice(0, 8)}…${w.address.slice(-6)}
+          ${w.label ? escapeHtml(w.label) + " · " : ""}${w.address.slice(0, 8)}…${w.address.slice(-6)}${w.address === mpState.ownerAddress ? " · owner" : ""}
         </div>
       `).join("") || `<div class="cp-wallet-pill empty">No wallets on this profile</div>`;
+
+      // Any wallet listed on the profile can edit it; only the owner — the
+      // wallet that created it — can delete it or approve a new wallet joining.
+      const permissionNote = !mpState.signingAddress
+        ? `<div class="cp-hint" style="margin-top:8px">Connect a wallet that's on this profile to make changes.</div>`
+        : mpState.isOwner
+          ? `<div class="cp-hint" style="margin-top:8px">You're signed in as the profile owner.</div>`
+          : mpState.isMember
+            ? `<div class="cp-hint" style="margin-top:8px">You can edit this profile. Only the owner wallet can delete it.</div>`
+            : `<div class="cp-hint" style="margin-top:8px">The connected wallet isn't on this profile, so it can't make changes.</div>`;
 
       app.innerHTML = `
         <div class="cp-page">
@@ -3792,21 +3809,23 @@
             <div class="cp-label" style="margin-bottom:12px">Wallets on this profile</div>
             <div>${walletList}</div>
             <div class="cp-hint" style="margin-top:8px">
-              Adding or removing wallets isn't wired up in the UI yet — each requires a signature from that specific wallet, which means connecting them one at a time. Reach out to us if you need this soon.
+              Adding a wallet isn't wired up in the UI yet. It needs two signatures — the owner wallet approving the specific address, then the wallet itself proving control — and the wallet kit connects one wallet at a time. Reach out to us if you need this soon.
             </div>
+            ${permissionNote}
           </div>
 
           <div class="cp-status" id="mpStatus"></div>
 
           <div class="cp-actions">
             <button class="btn btn-secondary" onclick="switchPage('portfolio')">Back to Portfolio</button>
-            <button class="btn" id="mpSave" onclick="saveProfileChanges()">Save Changes</button>
+            <button class="btn" id="mpSave" onclick="saveProfileChanges()"${mpState.isMember ? "" : " disabled"}>Save Changes</button>
           </div>
 
           <div class="cp-card" style="border-color:var(--red); margin-top:32px">
             <div class="cp-label" style="color:var(--red); margin-bottom:8px">Danger Zone</div>
             <div style="font-size:13px; color:var(--text-muted); line-height:1.5; margin-bottom:12px">
               Delete this profile permanently. The URL <span style="font-family:ui-monospace,SFMono-Regular,Menlo,monospace">/p/${escapeHtml(mpState.slug)}</span> will 404 and the slug becomes available for anyone to claim.
+              ${mpState.isOwner ? "" : `<br><strong>Only the owner wallet can delete this profile.</strong> Connect ${mpState.ownerAddress ? escapeHtml(mpState.ownerAddress.slice(0, 8)) + "…" + escapeHtml(mpState.ownerAddress.slice(-6)) : "the owner wallet"} to do that.`}
             </div>
             <div class="cp-field">
               <label class="cp-label" for="mpDeleteConfirm">Type <span style="font-family:ui-monospace,SFMono-Regular,Menlo,monospace">${escapeHtml(mpState.slug)}</span> to confirm</label>
@@ -3829,9 +3848,10 @@
           document.querySelectorAll("#mpEmojiPicker .cp-emoji-btn").forEach(b => b.classList.toggle("selected", b === btn));
         });
       });
+      document.getElementById("mpDeleteConfirm").disabled = !mpState.isOwner;
       document.getElementById("mpDeleteConfirm").addEventListener("input", (e) => {
         mpState.deleteConfirmText = e.target.value;
-        document.getElementById("mpDelete").disabled = e.target.value !== mpState.slug;
+        document.getElementById("mpDelete").disabled = !mpState.isOwner || e.target.value !== mpState.slug;
       });
     }
 
@@ -3845,12 +3865,18 @@
     // Ask the wallet to sign a challenge for (action, this profile) and hand
     // the signed pair back. Throws if the user cancels or the wallet returns
     // an unexpected shape.
-    async function requestSignedChallenge(action) {
-      if (!mpState.signingAddress) throw new Error("No wallet available to sign — connect a wallet on the profile");
+    async function requestSignedChallenge(action, target = null) {
+      if (!mpState.signingAddress) throw new Error("Connect a wallet that's on this profile to make changes");
+      if (action === "delete-profile" && !mpState.isOwner) {
+        throw new Error("Only the profile owner can delete it");
+      }
+      if (action === "modify-profile" && !mpState.isMember) {
+        throw new Error("The connected wallet isn't on this profile");
+      }
       const chRes = await fetch(`${API_BASE}/api/v1/auth/challenge`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ address: mpState.signingAddress, action, slug: mpState.slug }),
+        body: JSON.stringify({ address: mpState.signingAddress, action, slug: mpState.slug, target }),
       });
       const ch = await chRes.json();
       if (!chRes.ok) throw new Error(ch.error || "Failed to request challenge");

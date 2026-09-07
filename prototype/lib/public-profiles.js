@@ -21,6 +21,7 @@ function runMigrations(database = db) {
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     slug TEXT UNIQUE NOT NULL,
     display_name TEXT NOT NULL,
+    owner_address TEXT,
     bio TEXT,
     avatar_emoji TEXT DEFAULT '🚀',
     is_public INTEGER NOT NULL DEFAULT 1,
@@ -44,6 +45,14 @@ function runMigrations(database = db) {
   CREATE INDEX IF NOT EXISTS idx_profiles_slug ON public_profiles(slug);
   CREATE INDEX IF NOT EXISTS idx_profile_wallets_profile ON profile_wallets(profile_id);
 `);
+
+  // owner_address for databases created before it existed. SQLite has no
+  // ADD COLUMN IF NOT EXISTS, so check the table first.
+  const columns = database.prepare("PRAGMA table_info(public_profiles)").all();
+  if (!columns.some((c) => c.name === "owner_address")) {
+    database.exec("ALTER TABLE public_profiles ADD COLUMN owner_address TEXT");
+    console.log("[public-profiles] Migrated: added owner_address to public_profiles");
+  }
 }
 
 /**
@@ -52,7 +61,34 @@ function runMigrations(database = db) {
  * database. Idempotent.
  */
 function runBackfills(database = db) {
-  // placeholder — populated by later phases
+  // Profiles created before ownership existed have no owner. Adopt the
+  // lowest-display_order wallet — the one passed first at creation, which is
+  // also the one whose create-profile signature was verified first.
+  const orphaned = database.prepare(
+    "SELECT COUNT(*) AS c FROM public_profiles WHERE owner_address IS NULL"
+  ).get().c;
+  if (orphaned > 0) {
+    const result = database.prepare(`
+      UPDATE public_profiles
+         SET owner_address = (
+               SELECT address FROM profile_wallets
+                WHERE profile_id = public_profiles.id
+                ORDER BY display_order ASC, id ASC
+                LIMIT 1
+             )
+       WHERE owner_address IS NULL
+    `).run();
+    console.log(`[public-profiles] Backfill: set owner_address on ${result.changes} profile(s)`);
+    // A profile with no wallets at all cannot have an owner. That state was
+    // reachable before createProfileWithWallets made creation atomic; such a
+    // profile is unmanageable, so say so rather than failing silently later.
+    const stillNull = database.prepare(
+      "SELECT slug FROM public_profiles WHERE owner_address IS NULL"
+    ).all();
+    for (const row of stillNull) {
+      console.warn(`[public-profiles] Profile "${row.slug}" has no wallets and therefore no owner; it cannot be modified or deleted until a wallet is attached`);
+    }
+  }
 }
 
 runMigrations();
@@ -84,11 +120,12 @@ function createProfile(slug, displayName, options = {}) {
   }
 
   const result = db.prepare(`
-    INSERT INTO public_profiles (slug, display_name, bio, avatar_emoji, show_balances, show_defi, show_history)
-    VALUES (?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO public_profiles (slug, display_name, owner_address, bio, avatar_emoji, show_balances, show_defi, show_history)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
   `).run(
     cleanSlug,
     displayName,
+    options.ownerAddress || null,
     options.bio || null,
     options.avatarEmoji || "🚀",
     options.showBalances !== false ? 1 : 0,
@@ -96,7 +133,38 @@ function createProfile(slug, displayName, options = {}) {
     options.showHistory ? 1 : 0,
   );
 
-  return { id: result.lastInsertRowid, slug: cleanSlug, displayName };
+  return { id: result.lastInsertRowid, slug: cleanSlug, displayName, ownerAddress: options.ownerAddress || null };
+}
+
+// Indirection so a test can force the wallet insert to fail and assert the
+// whole creation rolls back. The transaction closure below captures the
+// module-local binding, so monkey-patching module.exports would do nothing.
+let _addWalletImpl = null;
+function _setAddWalletImpl(fn) {
+  if (process.env.NODE_ENV !== "test") return;
+  _addWalletImpl = fn;
+}
+
+/**
+ * Create a profile and attach its wallets in ONE transaction.
+ *
+ * Previously the route created the profile and then looped over
+ * addWalletToProfile. A failure mid-loop left a profile with no wallets — and
+ * now that ownership is derived from the first wallet, that means a profile
+ * with no owner: unmodifiable and undeletable.
+ */
+function createProfileWithWallets(slug, displayName, options = {}, wallets = []) {
+  if (!Array.isArray(wallets) || wallets.length === 0) {
+    throw new Error("At least one wallet is required to create a profile");
+  }
+  const ownerAddress = wallets[0].address;
+  const run = db.transaction(() => {
+    const profile = createProfile(slug, displayName, { ...options, ownerAddress });
+    const add = _addWalletImpl || addWalletToProfile;
+    for (const w of wallets) add(profile.slug, w.address, w.label || null);
+    return profile;
+  });
+  return run();
 }
 
 function getProfile(slug) {
@@ -111,6 +179,7 @@ function getProfile(slug) {
     id: profile.id,
     slug: profile.slug,
     displayName: profile.display_name,
+    ownerAddress: profile.owner_address || null,
     bio: profile.bio,
     avatarEmoji: profile.avatar_emoji,
     showBalances: !!profile.show_balances,
@@ -124,9 +193,13 @@ function getProfile(slug) {
 function updateProfile(slug, updates) {
   const sets = [];
   const values = [];
+  // isPublic is deliberately NOT settable here. getProfile filters
+  // `is_public = 1`, so PATCH {isPublic:false} made a profile permanently
+  // unreachable — including to its owner and to the delete path. Nothing in the
+  // SPA ever sent it. Re-adding it needs a paired unhide path first.
   const fieldMap = {
     displayName: "display_name", bio: "bio", avatarEmoji: "avatar_emoji",
-    showBalances: "show_balances", showDefi: "show_defi", showHistory: "show_history", isPublic: "is_public",
+    showBalances: "show_balances", showDefi: "show_defi", showHistory: "show_history",
   };
   for (const [key, col] of Object.entries(fieldMap)) {
     if (updates[key] !== undefined) {
@@ -187,8 +260,8 @@ function listPublicProfiles(limit = 50) {
 }
 
 module.exports = {
-  runMigrations, runBackfills,
-  createProfile, getProfile, updateProfile, deleteProfile,
+  runMigrations, runBackfills, _setAddWalletImpl, slugify,
+  createProfile, createProfileWithWallets, getProfile, updateProfile, deleteProfile,
   addWalletToProfile, removeWalletFromProfile, listPublicProfiles,
   listProfilesByWallet, isSlugAvailable,
 };
