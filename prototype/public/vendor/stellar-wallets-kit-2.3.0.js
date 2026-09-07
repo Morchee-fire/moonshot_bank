@@ -184,11 +184,13 @@ var ki=Object.create;var mn=Object.defineProperty;var Ei=Object.getOwnPropertyDe
     <button onClick="${()=>s()}" type="button" style="${i}" class="${h} ${n}">
       ${o}
     </button>
-  `}function Br(){Se.value=[]}function Re(e){De.value=e,Se.value=[...Se.value,e]}function Vr(){let e=Se.value;e.pop(),Se.value=e.slice(),De.value=e[e.length-1]}function ds({children:e,isActive:t,duration:r=300}){let[n,i]=fr(t),[o,s]=fr(t);if(hr(()=>{if(t)s(!0),globalThis.requestAnimationFrame(()=>i(!0));else{i(!1);let l=globalThis.setTimeout(()=>s(!1),r);return()=>globalThis.clearTimeout(l)}},[t,r]),!o)return null;let a={position:n?"relative":"absolute",inset:0,transition:`opacity ${r}ms ease, transform ${r}ms ease, position ${r}ms ease`,opacity:n?1:0};return S`<div style=${a}>${e}</div>`}function qo({currentRoute:e,pages:t,duration:r=300}){let n=Object.entries(t).map(([i,o])=>S`
+  `}function Br(){Se.value=[]}function Re(e){De.value=e,Se.value=[...Se.value,e]}function Vr(){let e=Se.value;e.pop(),Se.value=e.slice(),De.value=e[e.length-1]}function ds({children:e,isActive:t,duration:r=300}){let[n,i]=fr(t),[o,s]=fr(t);if(hr(()=>{if(t)s(!0),globalThis.requestAnimationFrame(()=>i(!0));else{i(!1);let l=globalThis.setTimeout(()=>s(!1),r);return()=>globalThis.clearTimeout(l)}},[t,r]),!o)return null;let a={position:n?"relative":"absolute",inset:0,transition:`opacity ${r}ms ease, transform ${r}ms ease, position ${r}ms ease`,opacity:n?1:0,scrollbarWidth:"none"};return S`<div style=${a}>${e}</div>`}function qo({currentRoute:e,pages:t,duration:r=300}){let n=Object.entries(t).map(([i,o])=>S`
       <${ds} id=${i} key=${i} isActive=${e===i} duration=${r}>
         <${o} />
-      <//>
-    `);return S`<div style=${{position:"relative",width:"100%",height:"100%"}}>${n}</div>`}function us(){Re(Q.HELP_PAGE)}function ps(){Vr()}var fs=pe(()=>De.value!==Q.AUTH_OPTIONS?Se.value.length<2?S``:S`
+        <//>
+    `);return S`
+    <div style=${{position:"relative",width:"100%",height:"100%"}}>${n}</div>
+  `}function us(){Re(Q.HELP_PAGE)}function ps(){Vr()}var fs=pe(()=>De.value!==Q.AUTH_OPTIONS?Se.value.length<2?S``:S`
       <${ge} onClick=${()=>ps()}
                  size="${W.md}"
                  mode="${te.ghost}"

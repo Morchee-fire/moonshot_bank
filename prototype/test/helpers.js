@@ -61,7 +61,14 @@ function signChallenge(profileAuth, { keypair, action, slug, target, variant = "
   if (!bytes) throw new Error(`unknown signing variant: ${variant}`);
   return {
     challengeToken: token,
-    signature: keypair.sign(bytes).toString("base64"),
+    // Buffer.from() is load-bearing across the stellar-sdk 15 -> 17 bump:
+    // Keypair.sign() returned a Buffer in 15 and returns a plain Uint8Array in
+    // 17, whose .toString("base64") is "12,34,56,…" rather than base64. Without
+    // the wrap, every signature test failed with "Signature has wrong length" —
+    // which is how the change was found. Production code never calls .sign()
+    // (wallets do the signing and hand back base64), so only tests were
+    // affected, but the failure looked alarming until traced.
+    signature: Buffer.from(keypair.sign(bytes)).toString("base64"),
     address: keypair.publicKey(),
   };
 }

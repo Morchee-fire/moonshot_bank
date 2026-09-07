@@ -150,7 +150,8 @@ test("a signature by a different key is rejected", () => {
   const { token, message } = profileAuth.issueChallenge({
     address: kp.publicKey(), action: "modify-profile", slug: "keb",
   });
-  const signature = other.sign(Buffer.from(message, "utf8")).toString("base64");
+  // Buffer.from(): Keypair.sign returns a Uint8Array in stellar-sdk 17.
+  const signature = Buffer.from(other.sign(Buffer.from(message, "utf8"))).toString("base64");
   assert.throws(() => profileAuth.verifyAndConsume({
     token, address: kp.publicKey(), signatureBase64: signature,
     expectedAction: "modify-profile", expectedSlug: "keb", expectedTarget: null,
